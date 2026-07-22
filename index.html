@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>手势控制与识别系统</title>
+<title>手势识别与交互系统</title>
 <style>
  :root{ --bg:#f6f7f9; --card:#ffffff; --line:#e8eaef; --fg:#1c1e22; --mut:#8b909a; --accent:#ff5c85; }
  *{ box-sizing:border-box; }
@@ -35,7 +35,7 @@
  .g .thumb img{ width:100%; height:100%; object-fit:cover; }
  .g .thumb .emoji{ font-size:32px; }
  .g .name{ margin-top:3px; }
- .g .del{ color:#e05a7a; cursor:pointer; font-size:11px; }
+ .g .del{ color:#e05a7a; cursor:pointer; font-size:11px; margin-top:2px; }
  .guide summary{ cursor:pointer; font-weight:600; font-size:14px; list-style:none; }
  .guide summary::-webkit-details-marker{ display:none; }
  .guide summary::before{ content:"▸ "; color:var(--accent); }
@@ -51,7 +51,6 @@
  </header>
 
  <div class="wrap">
-   <!-- 简易操作指南 -->
    <div class="card guide" style="grid-column:1/-1">
      <details open>
        <summary>📖 系统说明与快速上手</summary>
@@ -61,23 +60,21 @@
            <li><b>录制动作</b>：摆好对应的手势，点击「● 录制手势」，保持姿势 3 秒完成样本采样。</li>
            <li><b>实时识别</b>：对着摄像头做出手势，系统将通过 KNN 算法识别并在界面左侧实时弹出响应图盘。</li>
          </ol>
-         <p class="tip">💡 <b>数据持久化</b>：打开页面将自动载入 <code>samples.json</code>，所有新录制的手势也会同步更新该文件。</p>
+         <p class="tip">💡 <b>数据持久化</b>：所有的样本数据会转换为 Base64 编码保存在本地 JSON 中，无需额外配置图片文件夹。</p>
        </div>
      </details>
    </div>
 
-   <!-- 左侧：摄像头与识别结果区域 -->
    <div class="card">
      <div class="camwrap">
        <canvas id="cam" width="480" height="360"></canvas>
-       <div id="label">加载中…</div>
+       <div id="label">初始化中…</div>
      </div>
      <div id="output">
        <div class="hint">做出一个训练好的手势，结果将在此处实时显示 👋</div>
      </div>
    </div>
 
-   <!-- 右侧：录制与样本管理控制台 -->
    <div class="card">
      <strong style="font-size:14px">➕ 录制与新增手势</strong>
      <div class="field">1) 选择绑定图像或填入 Emoji</div>
@@ -95,7 +92,7 @@
        <button id="rec" class="primary">● 录制手势</button>
        <button id="recNeutral">🧘 录制中性(静止)</button>
      </div>
-     <div class="status" id="status"></div>
+     <div class="status" id="status">系统准备中…</div>
      <div class="gestures" id="list"></div>
      <div class="row" style="margin-top:12px">
        <button id="importBtn">📂 导入样本 JSON</button>
@@ -109,13 +106,14 @@
 <script type="module">
  import { createEngine } from "./engine.js";
  const API_BASE = "http://localhost:8000/api/samples";
+ const LS_KEY = "gesto_engine_samples";
 
  const $=s=>document.querySelector(s);
  const cam=$("#cam"), label=$("#label"), out=$("#output"), status=$("#status");
- let pendingImg=null, lastG=null, engineReady=false, camFailed=false, engine;
+ let pendingImg=null, engine=null;
 
  const STR = {
-   loadingModel: "加载模型中…",
+   loadingModel: "加载 AI 模型中…",
    ready: "系统就绪！已自动载入预设手势 👋",
    storageFull: "⚠ 存储过多",
    learned: (n) => "✓ 已成功学习「" + n + "」"
@@ -123,61 +121,85 @@
 
  const thumb = img => img && img.startsWith("data:") ? `<img src="${img}">` : `<div class="emoji">${img||"❓"}</div>`;
 
- // ==================== 自动导入与通信逻辑 ====================
- async function autoLoadSamples() {
-   let loadedData = null;
-
-   // 1. 优先尝试从 FastAPI 后端获取 samples.json
-   try {
-     const res = await fetch(API_BASE);
-     if (res.ok) {
-       const data = await res.json();
-       if (data && data.length > 0) {
-         loadedData = data;
-       }
-     }
-   } catch (e) {
-     console.warn("FastAPI 后端服务未连接，尝试本地静态读取模式...");
+ function parseJSONData(raw) {
+   if (!raw) return null;
+   let data = raw;
+   if (typeof data === "string") {
+     try { data = JSON.parse(data); } catch(e) { return null; }
    }
-
-   // 2. 如果后端没有启动或数据为空，尝试直接 fetch 读取项目根目录下的 static samples.json
-   if (!loadedData) {
-     try {
-       const staticRes = await fetch("./samples.json");
-       if (staticRes.ok) {
-         const staticData = await staticRes.json();
-         if (staticData && staticData.length > 0) {
-           loadedData = staticData;
-         }
-       }
-     } catch (e) {
-       console.warn("未读取到根目录下的 samples.json 静态文件");
-     }
+   if (typeof data === "string") {
+     try { data = JSON.parse(data); } catch(e) {}
    }
-
-   // 3. 如果成功自动抓取到了 samples.json，直接导入到网页缓存中
-   if (loadedData) {
-     localStorage.setItem("gesto_samples", JSON.stringify(loadedData));
-     console.log(`成功自动载入 ${loadedData.length} 条手势样本数据`);
-   }
+   return data;
  }
 
- async function syncToBackend() {
-   if (!engine) return;
-   try {
-     const rawExport = engine.export();
-     const samplesData = typeof rawExport === 'string' ? JSON.parse(rawExport) : rawExport;
-     const res = await fetch(API_BASE, {
-       method: "POST",
-       headers: { "Content-Type": "application/json" },
-       body: JSON.stringify({ samples: samplesData })
-     });
-     if (res.ok) {
-       status.textContent = "✓ 已同步保存至 后端 samples.json";
-     }
-   } catch (e) {
-     status.textContent = "⚠ 后端未启动，手势暂保存在本地浏览器中";
+ // 修复：即使数据为空对象 {}，也视作有效 JSON 结构，防止误判为解析失败
+ function getNormalizedSamples(rawData) {
+   let parsed = parseJSONData(rawData);
+   if (parsed === null || typeof parsed !== "object") return null;
+
+   if (parsed.samples && typeof parsed.samples === "object" && !Array.isArray(parsed.samples)) {
+     parsed = parsed.samples;
    }
+
+   let validDict = {};
+
+   function addGesture(id, name, img, samples) {
+     if (!id || id === "_说明") return;
+     if (!Array.isArray(samples)) return;
+
+     let normalizedSamples = samples;
+     if (typeof samples[0] === "number") {
+       normalizedSamples = [samples];
+     }
+
+     if (!validDict[id]) {
+       validDict[id] = {
+         name: name || id,
+         img: img || null,
+         samples: normalizedSamples
+       };
+     } else {
+       validDict[id].samples = validDict[id].samples.concat(normalizedSamples);
+     }
+   }
+
+   function processItem(obj, fallbackKey) {
+     if (!obj || typeof obj !== "object") return;
+
+     if (Array.isArray(obj.samples)) {
+       let id = obj.label || obj.id || fallbackKey || `g_${Date.now()}`;
+       addGesture(id, obj.name, obj.img, obj.samples);
+       return;
+     }
+
+     if (Array.isArray(obj.features)) {
+       let id = obj.label || obj.id || fallbackKey || `g_${Date.now()}`;
+       addGesture(id, obj.name, obj.img, [obj.features]);
+       return;
+     }
+
+     for (let key in obj) {
+       if (!Object.prototype.hasOwnProperty.call(obj, key)) continue;
+       if (key === "_说明") continue;
+       let child = obj[key];
+       if (child && typeof child === "object") {
+         if (Array.isArray(child.samples)) {
+           addGesture(key, child.name, child.img, child.samples);
+         } else if (Array.isArray(child.features)) {
+           addGesture(child.label || key, child.name, child.img, [child.features]);
+         }
+       }
+     }
+   }
+
+   if (Array.isArray(parsed)) {
+     parsed.forEach((item, index) => processItem(item, `g_imported_${index}`));
+   } else {
+     processItem(parsed, null);
+   }
+
+   return validDict; // 始终返回对象，不会返回 null（除非解析失败）
  }
 
  function showOutput(g){
@@ -194,17 +216,65 @@
 
  function renderList(){
    const gs = engine ? engine.gestures() : [];
-   $("#list").innerHTML = gs.map(g => `<div class="g"><div class="thumb">${thumb(g.img)}</div><div class="name">${g.name}${g.count ? ` ✓${g.count}` : ""}</div><div class="del" data-l="${g.label}">删除</div></div>`).join("");
-   $("#list").querySelectorAll(".del").forEach(b => {
-     b.onclick = async () => {
-       engine.remove(b.dataset.l);
-       await syncToBackend();
+   const listEl = $("#list");
+   
+   listEl.innerHTML = gs.map(g => {
+     const safeName = (g.name || "").replace(/"/g, '&quot;').replace(/'/g, "&#39;");
+     const safeLabel = (g.label || "").replace(/"/g, '&quot;').replace(/'/g, "&#39;");
+     return `
+       <div class="g">
+         <div class="thumb">${thumb(g.img)}</div>
+         <div class="name">${safeName}${g.count ? ` ✓${g.count}` : ""}</div>
+         <div class="del" data-l="${safeLabel}">删除</div>
+       </div>
+     `;
+   }).join("");
+
+   listEl.querySelectorAll(".del").forEach(b => {
+     b.onclick = () => {
+       const targetLabel = b.dataset.l;
+       if(engine) {
+         engine.remove(targetLabel);
+       }
+       
+       // 关键修复 1：同步触发 UI 渲染，不需要等待异步网络请求
        renderList();
+
+       const currentGs = engine ? engine.gestures() : [];
+       const stillExists = currentGs.some(g => g.label === targetLabel || g.name === label.textContent);
+       if (!stillExists && label.textContent !== "中性") {
+         showOutput(null);
+       }
+
+       // 后台静默同步至后端
+       syncToBackend();
      };
    });
  }
 
- // 图片上传处理
+ async function syncToBackend() {
+   if (!engine) return;
+   try {
+     const rawExport = engine.export();
+     const samplesDict = JSON.parse(rawExport);
+     
+     try {
+       localStorage.setItem(LS_KEY, JSON.stringify(samplesDict));
+     } catch (e) {
+       console.warn("LocalStorage 容量已满，跳过本地缓存，直接写入后端");
+     }
+
+     await fetch(API_BASE, {
+       method: "POST",
+       headers: { "Content-Type": "application/json" },
+       body: JSON.stringify({ samples: samplesDict })
+     });
+     status.textContent = "✓ 已同步保存至 后端 samples.json";
+   } catch (e) {
+     status.textContent = "⚠ 未连接后端，手势已保存在本地缓存中";
+   }
+ }
+
  $("#pick").onclick = () => $("#file").click();
  $("#file").onchange = e => {
    const f = e.target.files[0];
@@ -226,39 +296,8 @@
    }
  };
 
- // 系统初始化（入口）
- (async function initSystem() {
-   // 步骤 A：打开页面时，首先执行自动导入 samples.json 机制
-   await autoLoadSamples();
-
-   // 步骤 B：初始化手势引擎
-   try {
-     engine = await createEngine(cam, {
-       strings: STR,
-       onStatus: t => status.textContent = t,
-       onGesture: g => { lastG = g; showOutput(g); },
-       onRecordProgress: async (phase, val) => {
-         if (phase === "prep") { label.textContent = "准备 " + val; label.style.color = "#fd0"; }
-         else if (phase === "rec") { label.textContent = "录制中 " + val + "s"; label.style.color = "#f55"; }
-         else if (phase === "done") {
-           await syncToBackend();
-           renderList();
-         }
-       }
-     });
-     engineReady = true;
-     renderList();
-   } catch (e) {
-     camFailed = true;
-     status.textContent = "⚠ 需要摄像头权限，请允许使用摄像头。";
-     label.textContent = "无摄像头";
-     label.style.color = "#f88";
-   }
- })();
-
- // 按钮事件绑定
  $("#rec").onclick = () => {
-   if (!engine) return;
+   if (!engine) { alert("引擎尚未加载完毕，请稍候…"); return; }
    const name = $("#name").value.trim();
    if (!name) { status.textContent = "⚠ 请先输入手势名称"; return; }
    const existing = engine.gestures().find(g => g.name === name);
@@ -274,9 +313,8 @@
    }
  };
 
- // ==================== 手动导入 JSON 功能 ====================
  $("#importBtn").onclick = () => $("#importFile").click();
-
+ 
  $("#importFile").onchange = e => {
    const file = e.target.files[0];
    if (!file) return;
@@ -284,41 +322,50 @@
    const reader = new FileReader();
    reader.onload = async () => {
      try {
-       const importedData = JSON.parse(reader.result);
-       const samplesList = Array.isArray(importedData) ? importedData : (importedData.samples || []);
-
-       if (!samplesList || samplesList.length === 0) {
-         status.textContent = "⚠ 导入失败：上传的文件中不包含有效手势";
+       const validDict = getNormalizedSamples(reader.result);
+       if (validDict === null) {
+         status.textContent = "⚠ 导入失败：未发现有效手势样本数据或格式错误";
          return;
        }
 
-       // 1. 存入本地缓存
-       localStorage.setItem("gesto_samples", JSON.stringify(samplesList));
+       const count = Object.keys(validDict).length;
+       
+       try {
+         localStorage.setItem(LS_KEY, JSON.stringify(validDict));
+       } catch (err) {
+         console.warn("LocalStorage 存储提示:", err);
+       }
 
-       // 2. 如果后端开启，同步覆盖写进后端的 samples.json
+       if (engine) {
+         engine.setSamples(validDict);
+       }
+
+       renderList();
+       showOutput(null);
+
+       status.textContent = `✓ 正在同步导入的数据至后端…`;
        try {
          await fetch(API_BASE, {
            method: "POST",
            headers: { "Content-Type": "application/json" },
-           body: JSON.stringify({ samples: samplesList })
+           body: JSON.stringify({ samples: validDict })
          });
+         status.textContent = `✓ 导入成功 (${count} 个手势) 且已实时生效！`;
        } catch (err) {
-         console.warn("手动导入：后端未连接，仅更新本地页面");
+         status.textContent = `✓ 导入成功 (${count} 个手势) 且已实时生效！(后端未连接)`;
        }
-
-       status.textContent = `✓ 成功导入 ${samplesList.length} 个手势！正在加载...`;
-       setTimeout(() => location.reload(), 600);
      } catch (err) {
-       console.error(err);
-       status.textContent = "⚠ 解析失败，请确保上传的是合规的 samples.json 文件";
+       console.error("导入出错:", err);
+       status.textContent = "⚠ 文件解析失败";
+     } finally {
+       e.target.value = "";
      }
    };
    reader.readAsText(file);
  };
 
- // 导出 JSON 功能
  $("#export").onclick = () => {
-   if (!engine) return;
+   if (!engine) { alert("引擎未启动，无法导出"); return; }
    const blob = new Blob([engine.export()], { type: "application/json" });
    const a = document.createElement("a");
    a.href = URL.createObjectURL(blob);
@@ -326,16 +373,90 @@
    a.click();
  };
 
- // 清空功能
- $("#clear").onclick = async () => {
-   if (engine && confirm("确定要清空所有已保存的手势数据吗？")) {
-     engine.clearAll();
-     await syncToBackend();
+ $("#clear").onclick = () => {
+   if (confirm("确定要清空所有已保存的手势数据吗？")) {
+     if (engine) {
+       engine.clearAll();
+     }
+     try {
+       localStorage.setItem(LS_KEY, "{}");
+     } catch(e) {}
+     
+     // 关键修复 2：秒级清空 UI
      renderList();
-     lastG = null;
      showOutput(null);
+     status.textContent = "已清空所有数据";
+
+     syncToBackend();
    }
  };
+
+ // 关键修复 3：后端返回为空数据时也能正确识别为“已被删除干净”，绝不误加载默认手势
+ async function autoLoadSamples() {
+   try {
+     const controller = new AbortController();
+     const timeoutId = setTimeout(() => controller.abort(), 1500);
+     
+     const res = await fetch(API_BASE, { signal: controller.signal });
+     clearTimeout(timeoutId);
+
+     if (res.ok) {
+       const rawData = await res.json();
+       const validDict = getNormalizedSamples(rawData);
+       if (validDict !== null) {
+         try { localStorage.setItem(LS_KEY, JSON.stringify(validDict)); } catch(e){}
+         return;
+       }
+     }
+   } catch (e) {
+     console.warn("后端未响应或超时，自动切换至本地缓存模式");
+   }
+
+   const existingData = localStorage.getItem(LS_KEY);
+   if (existingData !== null && existingData !== "undefined") {
+     const validDict = getNormalizedSamples(existingData);
+     if (validDict !== null) return;
+   }
+
+   try {
+     const staticRes = await fetch("./samples.json");
+     if (staticRes.ok) {
+       const staticData = await staticRes.json();
+       const validDict = getNormalizedSamples(staticData);
+       if (validDict !== null) {
+         try { localStorage.setItem(LS_KEY, JSON.stringify(validDict)); } catch(e){}
+       }
+     }
+   } catch (e) {}
+ }
+
+ (async function initSystem() {
+   console.log("正在初始化系统…");
+   await autoLoadSamples();
+
+   try {
+     engine = await createEngine(cam, {
+       strings: STR,
+       onStatus: t => status.textContent = t,
+       onGesture: g => showOutput(g),
+       onRecordProgress: async (phase, val) => {
+         if (phase === "prep") { label.textContent = "准备 " + val; label.style.color = "#fd0"; }
+         else if (phase === "rec") { label.textContent = "录制中 " + val + "s"; label.style.color = "#f55"; }
+         else if (phase === "done") {
+           await syncToBackend();
+           renderList();
+         }
+       }
+     });
+     renderList();
+     status.textContent = "✓ 系统及摄像头加载就绪";
+   } catch (e) {
+     console.error("引擎初始化失败:", e);
+     status.textContent = "⚠ 摄像头请求失败或网络超时，请检查浏览器摄像权限与网络连接。";
+     label.textContent = "初始化失败";
+     label.style.color = "#f88";
+   }
+ })();
 </script>
 </body>
 </html>
