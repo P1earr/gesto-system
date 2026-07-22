@@ -4,6 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>手势识别与交互系统</title>
+<!-- 引入 Dexie.js (IndexedDB 极简封装库，彻底解决 5MB 容量上限) -->
+<script src="https://unpkg.com/dexie@3/dist/dexie.js"></script>
 <style>
  :root{ --bg:#f6f7f9; --card:#ffffff; --line:#e8eaef; --fg:#1c1e22; --mut:#8b909a; --accent:#ff5c85; }
  *{ box-sizing:border-box; }
@@ -57,10 +59,10 @@
        <div>
          <ol>
            <li><b>选择图像与名称</b>：在右侧控制面板选择需要绑定的表情图片/Emoji，并起一个手势名称。</li>
-           <li><b>录制动作</b>：摆好对应的手势，点击「● 录制手势」，保持姿势 3 秒完成样本采样。</li>
+           <li><b>录制动作</b>：摆好对应的手势，点击「● 录制手势」，保持姿态 3 秒完成样本采样。</li>
            <li><b>实时识别</b>：对着摄像头做出手势，系统将通过 KNN 算法识别并在界面左侧实时弹出响应图盘。</li>
          </ol>
-         <p class="tip">💡 <b>数据持久化</b>：所有的样本数据会转换为 Base64 编码保存在本地 JSON 中，无需额外配置图片文件夹。</p>
+         <p class="tip">💡 <b>双重存储架构</b>：图片优先存入后端静态目录；纯前端模式下基于 IndexedDB 离线存储，解除 5MB 容量限制。</p>
        </div>
      </details>
    </div>
@@ -87,7 +89,7 @@
      </div>
      <div class="field">2) 输入手势名称</div>
      <input type="text" id="name" placeholder="例如：比心 / 举手 / 胜利">
-     <div class="field">3) 摆好姿势并点击录制</div>
+     <div class="field">3) 摆好姿态并点击录制</div>
      <div class="row">
        <button id="rec" class="primary">● 录制手势</button>
        <button id="recNeutral">🧘 录制中性(静止)</button>
@@ -105,8 +107,30 @@
 
 <script type="module">
  import { createEngine } from "./engine.js";
- const API_BASE = "http://localhost:8000/api/samples";
+const API_BASE = "http://127.0.0.1:8080/api/samples";
+const API_UPLOAD = "http://127.0.0.1:8080/api/upload_image";
  const LS_KEY = "gesto_engine_samples";
+
+ // 1. 初始化 IndexedDB 本地数据库 (取代容量较小的 localStorage)
+ const db = new Dexie("GestoEngineDB");
+ db.version(1).stores({ samples: "key, data" });
+
+ async function getIDBSamples() {
+   try {
+     const record = await db.samples.get(LS_KEY);
+     return record ? record.data : null;
+   } catch (e) {
+     return null;
+   }
+ }
+
+ async function setIDBSamples(data) {
+   try {
+     await db.samples.put({ key: LS_KEY, data: data });
+   } catch (e) {
+     console.warn("IndexedDB 写入失败:", e);
+   }
+ }
 
  const $=s=>document.querySelector(s);
  const cam=$("#cam"), label=$("#label"), out=$("#output"), status=$("#status");
@@ -119,7 +143,14 @@
    learned: (n) => "✓ 已成功学习「" + n + "」"
  };
 
- const thumb = img => img && img.startsWith("data:") ? `<img src="${img}">` : `<div class="emoji">${img||"❓"}</div>`;
+ // 全兼容缩略图渲染函数
+ const thumb = img => {
+   if (!img) return `<div class="emoji">❓</div>`;
+   if (img.startsWith("data:") || img.startsWith("http") || img.startsWith("/static")) {
+     return `<img src="${img}">`;
+   }
+   return `<div class="emoji">${img}</div>`;
+ };
 
  function parseJSONData(raw) {
    if (!raw) return null;
@@ -133,7 +164,6 @@
    return data;
  }
 
- // 修复：即使数据为空对象 {}，也视作有效 JSON 结构，防止误判为解析失败
  function getNormalizedSamples(rawData) {
    let parsed = parseJSONData(rawData);
    if (parsed === null || typeof parsed !== "object") return null;
@@ -199,7 +229,7 @@
      processItem(parsed, null);
    }
 
-   return validDict; // 始终返回对象，不会返回 null（除非解析失败）
+   return validDict;
  }
 
  function showOutput(g){
@@ -211,7 +241,9 @@
    }
    label.textContent = g.name;
    label.style.color = "#7fffd4";
-   out.innerHTML = g.img && g.img.startsWith("data:") ? `<img src="${g.img}">` : `<div class="emoji">${g.img||"❓"}</div>`;
+   out.innerHTML = g.img && (g.img.startsWith("data:") || g.img.startsWith("http") || g.img.startsWith("/static")) 
+     ? `<img src="${g.img}">` 
+     : `<div class="emoji">${g.img||"❓"}</div>`;
  }
 
  function renderList(){
@@ -237,7 +269,6 @@
          engine.remove(targetLabel);
        }
        
-       // 关键修复 1：同步触发 UI 渲染，不需要等待异步网络请求
        renderList();
 
        const currentGs = engine ? engine.gestures() : [];
@@ -246,7 +277,6 @@
          showOutput(null);
        }
 
-       // 后台静默同步至后端
        syncToBackend();
      };
    });
@@ -258,11 +288,7 @@
      const rawExport = engine.export();
      const samplesDict = JSON.parse(rawExport);
      
-     try {
-       localStorage.setItem(LS_KEY, JSON.stringify(samplesDict));
-     } catch (e) {
-       console.warn("LocalStorage 容量已满，跳过本地缓存，直接写入后端");
-     }
+     await setIDBSamples(samplesDict);
 
      await fetch(API_BASE, {
        method: "POST",
@@ -271,24 +297,71 @@
      });
      status.textContent = "✓ 已同步保存至 后端 samples.json";
    } catch (e) {
-     status.textContent = "⚠ 未连接后端，手势已保存在本地缓存中";
+     status.textContent = "⚠ 未连接后端，手势已保存至本地 IndexedDB 数据库";
    }
  }
 
  $("#pick").onclick = () => $("#file").click();
- $("#file").onchange = e => {
+
+// 选择图片逻辑：增加 2 秒超时控制，后端不可用时自动降级为本地读取
+// 选择图片逻辑：自动上传服务器，失败时清晰显示报错原因并降级
+ $("#file").onchange = async e => {
    const f = e.target.files[0];
    if (!f) return;
-   const r = new FileReader();
-   r.onload = () => {
-     pendingImg = r.result;
+
+   status.textContent = "正在尝试上传至后端…";
+   let uploadSuccess = false;
+   let errorMsg = "";
+
+   // 1. 尝试上传至后端（带 2 秒超时）
+   try {
+     const controller = new AbortController();
+     const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+     const formData = new FormData();
+     formData.append("file", f);
+
+     const res = await fetch(API_UPLOAD, {
+       method: "POST",
+       body: formData,
+       signal: controller.signal
+     });
+     clearTimeout(timeoutId);
+
+     if (res.ok) {
+       const data = await res.json();
+       pendingImg = `http://127.0.0.1:8080${data.url}`;
+       uploadSuccess = true;
+       status.textContent = "✓ 图片已成功保存至后端 static/uploads/";
+     } else {
+       errorMsg = `HTTP ${res.status} (接口不存在或服务器内部错误)`;
+     }
+   } catch (err) {
+     console.error("上传真实报错:", err);
+     errorMsg = err.name === "AbortError" ? "连接超时(2s)" : (err.message || "无法连接后端");
+   }
+
+   // 2. 降级为本地 Base64 模式（保留真实的报错原因）
+   if (!uploadSuccess) {
+     const r = new FileReader();
+     r.onload = () => {
+       pendingImg = r.result;
+       const p = $("#prev");
+       p.src = pendingImg;
+       p.style.display = "inline-block";
+       $("#emoji").value = "";
+       // 这里把真正的失败原因带出来！
+       status.textContent = `⚠ 未能存入后端 (${errorMsg})，已切为本地预览`;
+     };
+     r.readAsDataURL(f);
+   } else {
      const p = $("#prev");
      p.src = pendingImg;
      p.style.display = "inline-block";
      $("#emoji").value = "";
-   };
-   r.readAsDataURL(f);
+   }
  };
+
  $("#emoji").oninput = () => {
    if ($("#emoji").value) {
      pendingImg = null;
@@ -303,7 +376,7 @@
    const existing = engine.gestures().find(g => g.name === name);
    if (!existing && !pendingImg && !$("#emoji").value) { status.textContent = "⚠ 请先选择图片或填入 Emoji"; return; }
    engine.record({ label: existing ? existing.label : "g_" + Date.now(), name, img: existing ? undefined : (pendingImg || $("#emoji").value) });
-   status.textContent = "准备…请摆好手势";
+   status.textContent = "准备…请摆好姿态";
  };
 
  $("#recNeutral").onclick = () => {
@@ -329,12 +402,7 @@
        }
 
        const count = Object.keys(validDict).length;
-       
-       try {
-         localStorage.setItem(LS_KEY, JSON.stringify(validDict));
-       } catch (err) {
-         console.warn("LocalStorage 存储提示:", err);
-       }
+       await setIDBSamples(validDict);
 
        if (engine) {
          engine.setSamples(validDict);
@@ -373,16 +441,13 @@
    a.click();
  };
 
- $("#clear").onclick = () => {
+ $("#clear").onclick = async () => {
    if (confirm("确定要清空所有已保存的手势数据吗？")) {
      if (engine) {
        engine.clearAll();
      }
-     try {
-       localStorage.setItem(LS_KEY, "{}");
-     } catch(e) {}
+     await setIDBSamples({});
      
-     // 关键修复 2：秒级清空 UI
      renderList();
      showOutput(null);
      status.textContent = "已清空所有数据";
@@ -391,7 +456,6 @@
    }
  };
 
- // 关键修复 3：后端返回为空数据时也能正确识别为“已被删除干净”，绝不误加载默认手势
  async function autoLoadSamples() {
    try {
      const controller = new AbortController();
@@ -404,16 +468,16 @@
        const rawData = await res.json();
        const validDict = getNormalizedSamples(rawData);
        if (validDict !== null) {
-         try { localStorage.setItem(LS_KEY, JSON.stringify(validDict)); } catch(e){}
+         await setIDBSamples(validDict);
          return;
        }
      }
    } catch (e) {
-     console.warn("后端未响应或超时，自动切换至本地缓存模式");
+     console.warn("后端未响应或超时，自动切换至本地 IndexedDB 缓存模式");
    }
 
-   const existingData = localStorage.getItem(LS_KEY);
-   if (existingData !== null && existingData !== "undefined") {
+   const existingData = await getIDBSamples();
+   if (existingData !== null && existingData !== undefined) {
      const validDict = getNormalizedSamples(existingData);
      if (validDict !== null) return;
    }
@@ -424,7 +488,7 @@
        const staticData = await staticRes.json();
        const validDict = getNormalizedSamples(staticData);
        if (validDict !== null) {
-         try { localStorage.setItem(LS_KEY, JSON.stringify(validDict)); } catch(e){}
+         await setIDBSamples(validDict);
        }
      }
    } catch (e) {}
